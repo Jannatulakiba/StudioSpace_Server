@@ -8,18 +8,17 @@ const port = process.env.PORT || 5000;
 
 const allowed = [
   "http://localhost:3000",
+  "https://a8-studio-space.vercel.app",
   "https://studiospace-mu.vercel.app",
-  process.env.FRONTEND_URL, // Vercel frontend URL, trailing slash chhara
+  process.env.FRONTEND_URL,
 ].filter(Boolean);
 
 app.use(
   cors({
-    origin: (origin, cb) => {
-      if (!origin || allowed.includes(origin)) return cb(null, true);
-      cb(new Error("Not allowed by CORS"));
-    },
+    origin: allowed,
     credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 app.use(express.json());
@@ -393,8 +392,13 @@ app.get("/", (req, res) => res.send({ status: "StudioSpace server running" }));
 
 app.use((req, res) => res.status(404).send({ message: `Route not found: ${req.method} ${req.originalUrl}` }));
 
-if (process.env.VERCEL) {
-  module.exports = app;
-} else {
+if (require.main === module) {
   app.listen(port, () => console.log(`Server on port ${port}`));
 }
+module.exports = app;
+
+// if (process.env.VERCEL) {
+//   module.exports = app;
+// } else {
+//   app.listen(port, () => console.log(`Server on port ${port}`));
+// }
