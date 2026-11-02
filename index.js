@@ -6,9 +6,18 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const app = express();
 const port = process.env.PORT || 5000;
 
+const allowed = [
+  "http://localhost:3000",
+  "https://studiospace-mu.vercel.app",
+  process.env.FRONTEND_URL, // Vercel frontend URL, trailing slash chhara
+].filter(Boolean);
+
 app.use(
   cors({
-    origin: ["http://localhost:3000", "https://a8-studiospace.onrender.com"],
+    origin: (origin, cb) => {
+      if (!origin || allowed.includes(origin)) return cb(null, true);
+      cb(new Error("Not allowed by CORS"));
+    },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
   })
@@ -28,7 +37,7 @@ const wrap = (fn) => (req, res) =>
     res.status(500).send({ message: "Server error" });
   });
 
-// ---------- AUTO SEED (প্রথমবার ডাটাবেস খালি থাকলে ডেমো স্টুডিও ঢুকবে) ----------
+
 const mk = (n, images, title, category, hourlyRate, deposit, capacity, location, rating, amenities, ownerName, ownerEmail, overview) => ({
   title, category, hourlyRate, deposit, capacity, location,
   images: images.map((x) => `/studios/${x}.jpg`),
@@ -51,13 +60,13 @@ const demoStudios = () => [
   mk(8, [3, 1, 5], "Riverside Band Room", "Music Suite", 35, 60, 7, "Barishal Sadar", 4.6, ["Parking", "Acoustic panels", "Wi-Fi"], "Demo Examiner", "examiner@studiospace.com", "Rehearsal room with a full backline, drum kit and PA, plus a river view lounge."),
 ];
 
-// meta collection-এর unique _id দিয়ে lock: একসাথে অনেক cold start হলেও একবারই seed হবে
+
 async function seedStudios(db) {
   const meta = db.collection("meta");
   try {
     await meta.insertOne({ _id: "studios-seeded", at: new Date().toISOString() });
   } catch (e) {
-    if (e.code === 11000) return; // আগেই seed হয়েছে (বা অন্য instance করছে)
+    if (e.code === 11000) return; 
     throw e;
   }
   try {
@@ -67,12 +76,12 @@ async function seedStudios(db) {
       console.log("Demo studios seeded");
     }
   } catch (e) {
-    await meta.deleteOne({ _id: "studios-seeded" }); // ব্যর্থ হলে পরের বার আবার চেষ্টা হবে
+    await meta.deleteOne({ _id: "studios-seeded" });
     throw e;
   }
 }
 
-// Lazy DB connection: Vercel/serverless এবং লোকাল দুই জায়গাতেই কাজ করবে
+
 let dbPromise;
 function getDb() {
   if (!dbPromise) {
@@ -84,7 +93,7 @@ function getDb() {
       console.log("MongoDB connected");
       return db;
     })().catch((e) => {
-      dbPromise = null; // পরের request-এ আবার চেষ্টা করবে
+      dbPromise = null; 
       throw e;
     });
   }
@@ -198,7 +207,7 @@ app.delete(
   })
 );
 
-// Review যোগ করা ও গড় rating আপডেট
+
 app.post(
   "/api/studios/:id/reviews",
   wrap(async (req, res) => {
@@ -349,7 +358,7 @@ app.patch(
   })
 );
 
-// Pending booking Confirmed করা (confirm করার সময়ও overlap check)
+
 app.patch(
   "/api/bookings/:id/confirm",
   wrap(async (req, res) => {
@@ -379,7 +388,10 @@ app.patch(
   })
 );
 
-app.get("/", (req, res) => res.send("StudioSpace server running"));
+
+app.get("/", (req, res) => res.send({ status: "StudioSpace server running" }));
+
+app.use((req, res) => res.status(404).send({ message: `Route not found: ${req.method} ${req.originalUrl}` }));
 
 if (process.env.VERCEL) {
   module.exports = app;
