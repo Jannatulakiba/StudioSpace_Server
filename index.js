@@ -1,10 +1,14 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const jwt = require("jsonwebtoken");
+const cookieParser = require("cookie-parser");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 
 const app = express();
 const port = process.env.PORT || 5000;
+const isProd = process.env.NODE_ENV === "production";
+if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is not set");
 
 const allowed = [
   "http://localhost:3000",
@@ -22,21 +26,26 @@ app.use(
   })
 );
 app.use(express.json());
+app.use(cookieParser());
 
 const client = new MongoClient(process.env.MONGODB_URI, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
 });
 
+/* ---------------- ছোট helper ---------------- */
+const fail = (res, code, message) => res.status(code).send({ message });
+const ser = (d) => ({ ...d, _id: d._id.toString() });
+const oid = (id) => new ObjectId(id);
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const validHour = (h) => Number.isInteger(h) && h >= 0 && h <= 24;
+const NUMS = ["hourlyRate", "deposit", "capacity"];
 
-// এরর হলে request ঝুলে না থেকে 500 ফেরত দেবে
-const wrap = (fn) => (req, res) =>
-  fn(req, res).catch((e) => {
-    console.error(e);
-    res.status(500).send({ message: "Server error" });
-  });
+// :id আছে এমন সব route-এ একবারেই id যাচাই
+app.param("id", (req, res, next, id) =>
+  ObjectId.isValid(id) ? next() : fail(res, 400, "Invalid id")
+);
 
-
+/* ---------------- db ---------------- */
 const mk = (n, images, title, category, hourlyRate, deposit, capacity, location, rating, amenities, ownerName, ownerEmail, overview) => ({
   title, category, hourlyRate, deposit, capacity, location,
   images: images.map((x) => `/studios/${x}.jpg`),
@@ -59,13 +68,12 @@ const demoStudios = () => [
   mk(8, [3, 1, 5], "Riverside Band Room", "Music Suite", 35, 60, 7, "Barishal Sadar", 4.6, ["Parking", "Acoustic panels", "Wi-Fi"], "Demo Examiner", "examiner@studiospace.com", "Rehearsal room with a full backline, drum kit and PA, plus a river view lounge."),
 ];
 
-
 async function seedStudios(db) {
   const meta = db.collection("meta");
   try {
     await meta.insertOne({ _id: "studios-seeded", at: new Date().toISOString() });
   } catch (e) {
-    if (e.code === 11000) return; 
+    if (e.code === 11000) return;
     throw e;
   }
   try {
@@ -80,7 +88,6 @@ async function seedStudios(db) {
   }
 }
 
-
 let dbPromise;
 function getDb() {
   if (!dbPromise) {
@@ -92,313 +99,280 @@ function getDb() {
       console.log("MongoDB connected");
       return db;
     })().catch((e) => {
-      dbPromise = null; 
+      dbPromise = null;
       throw e;
     });
   }
   return dbPromise;
 }
-
 const col = async (name) => (await getDb()).collection(name);
-const validHour = (h) => Number.isInteger(h) && h >= 0 && h <= 24;
 
-// ---------- STUDIOS ----------
-app.get(
-  "/api/studios",
-  wrap(async (req, res) => {
-    const studios = await col("studios");
-    const { search, category, owner, sort, limit } = req.query;
-    const query = {};
-    if (category) query.category = String(category);
-    if (owner) query.ownerEmail = String(owner);
-    if (search) {
-      const rx = new RegExp(escapeRegex(String(search)), "i");
-      query.$or = [{ title: rx }, { location: rx }];
+/* ---------------- auth ---------------- */
+const AUTH_URL = (process.env.BETTER_AUTH_URL || "http://localhost:3000").replace(/\/$/, "");
+const cookieOpts = {
+  httpOnly: true,
+  secure: isProd,
+  sameSite: isProd ? "none" : "lax",
+  path: "/",
+};
+
+// BetterAuth-এর JWT, তার public key (JWKS) দিয়ে যাচাই
+let joseLib, jwks;
+async function verifyAuthToken(token) {
+  joseLib ||= await import("jose");
+  jwks ||= joseLib.createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
+  const { payload } = await joseLib.jwtVerify(token, jwks, { issuer: AUTH_URL, audience: AUTH_URL });
+  return payload;
+}
+
+const verifyToken = (req, res, next) => {
+  try {
+    req.user = jwt.verify(req.cookies?.token, process.env.JWT_SECRET, { audience: "studiospace-api" });
+    next();
+  } catch {
+    fail(res, 401, "Unauthorized");
+  }
+};
+
+// সব route-এর জন্য একটাই function:
+//   handle(fn)        → login লাগবে (verifyToken) + error হলে 500
+//   handle(fn, false) → খোলা route + error হলে 500
+const handle = (fn, auth = true) => [
+  ...(auth ? [verifyToken] : []),
+  (req, res) =>
+    fn(req, res).catch((e) => {
+      console.error(e);
+      fail(res, 500, "Server error");
+    }),
+];
+
+// studio-র মালিক না হলে error পাঠিয়ে null ফেরত দেয়
+const ownStudio = async (req, res) => {
+  const s = await (await col("studios")).findOne({ _id: oid(req.params.id) });
+  if (!s) fail(res, 404, "Studio not found");
+  else if (s.ownerEmail !== req.user.email) fail(res, 403, "Forbidden: this is not your studio");
+  else return s;
+  return null;
+};
+
+app.post(
+  "/api/jwt",
+  handle(async (req, res) => {
+    if (!req.body.token) return fail(res, 400, "token is required");
+    let p;
+    try {
+      p = await verifyAuthToken(req.body.token);
+    } catch (e) {
+      console.error("Auth token verify failed:", e.message);
+      return fail(res, 401, "Invalid or expired token");
     }
-    const sorts = {
-      rating: { rating: -1 },
-      newest: { createdAt: -1 },
-      "price-asc": { hourlyRate: 1 },
-      "price-desc": { hourlyRate: -1 },
-    };
-    let cursor = studios.find(query).sort(sorts[sort] || sorts.newest);
-    if (limit) cursor = cursor.limit(Math.min(Number(limit) || 20, 100));
-    const list = await cursor.toArray();
-    res.send(list.map((s) => ({ ...s, _id: s._id.toString() })));
-  })
-);
+    if (!p.email) return fail(res, 401, "Token has no email");
 
-app.get(
-  "/api/studios/:id",
-  wrap(async (req, res) => {
-    if (!ObjectId.isValid(req.params.id))
-      return res.status(400).send({ message: "Invalid id" });
-    const studios = await col("studios");
-    const s = await studios.findOne({ _id: new ObjectId(req.params.id) });
-    if (!s) return res.status(404).send({ message: "Studio not found" });
-    res.send({ ...s, _id: s._id.toString() });
-  })
-);
-
-app.post(
-  "/api/studios",
-  wrap(async (req, res) => {
-    const studios = await col("studios");
-    // ক্লায়েন্ট যেন _id, rating, createdAt নিজে সেট করতে না পারে
-    const { _id, rating, createdAt, ...d } = req.body;
-    if (!d.title) return res.status(400).send({ message: "Title is required" });
-
-    const doc = {
-      ...d,
-      hourlyRate: Number(d.hourlyRate),
-      deposit: Number(d.deposit),
-      capacity: Number(d.capacity),
-      reviews: Array.isArray(d.reviews) ? d.reviews : [],
-      rating: 0,
-      createdAt: new Date().toISOString(),
-    };
-    if ([doc.hourlyRate, doc.deposit, doc.capacity].some((n) => Number.isNaN(n)))
-      return res
-        .status(400)
-        .send({ message: "hourlyRate, deposit and capacity must be numbers" });
-
-    const r = await studios.insertOne(doc);
-    res.status(201).send({ ...doc, _id: r.insertedId.toString() });
-  })
-);
-
-app.put(
-  "/api/studios/:id",
-  wrap(async (req, res) => {
-    if (!ObjectId.isValid(req.params.id))
-      return res.status(400).send({ message: "Invalid id" });
-    const studios = await col("studios");
-    const { _id, rating, reviews, createdAt, ...patch } = req.body;
-    if (!Object.keys(patch).length)
-      return res.status(400).send({ message: "Nothing to update" });
-
-    for (const k of ["hourlyRate", "deposit", "capacity"]) {
-      if (patch[k] !== undefined) {
-        patch[k] = Number(patch[k]);
-        if (Number.isNaN(patch[k]))
-          return res.status(400).send({ message: `${k} must be a number` });
-      }
-    }
-
-    const r = await studios.updateOne(
-      { _id: new ObjectId(req.params.id) },
-      { $set: patch }
-    );
-    if (!r.matchedCount) return res.status(404).send({ message: "Studio not found" });
-    res.send({ ok: true });
-  })
-);
-
-app.delete(
-  "/api/studios/:id",
-  wrap(async (req, res) => {
-    if (!ObjectId.isValid(req.params.id))
-      return res.status(400).send({ message: "Invalid id" });
-    const studios = await col("studios");
-    const r = await studios.deleteOne({ _id: new ObjectId(req.params.id) });
-    if (!r.deletedCount) return res.status(404).send({ message: "Studio not found" });
-    res.send({ ok: true });
-  })
-);
-
-
-app.post(
-  "/api/studios/:id/reviews",
-  wrap(async (req, res) => {
-    if (!ObjectId.isValid(req.params.id))
-      return res.status(400).send({ message: "Invalid id" });
-    const { userName, userEmail, rating, comment } = req.body;
-    const r = Number(rating);
-    if (!comment || !r || r < 1 || r > 5)
-      return res
-        .status(400)
-        .send({ message: "Rating (1-5) and comment are required" });
-
-    const studios = await col("studios");
-    const _id = new ObjectId(req.params.id);
-    const review = {
-      userName,
-      userEmail,
-      rating: r,
-      comment,
-      createdAt: new Date().toISOString(),
-    };
-
-    const pushed = await studios.updateOne({ _id }, { $push: { reviews: review } });
-    if (!pushed.matchedCount)
-      return res.status(404).send({ message: "Studio not found" });
-
-    const s = await studios.findOne({ _id });
-    const list = s?.reviews || [];
-    if (list.length) {
-      const avg = list.reduce((sum, x) => sum + x.rating, 0) / list.length;
-      await studios.updateOne({ _id }, { $set: { rating: Math.round(avg * 10) / 10 } });
-    }
-    res.status(201).send(review);
-  })
-);
-
-// ---------- USERS ----------
-app.post(
-  "/api/users",
-  wrap(async (req, res) => {
-    const { name, email, image } = req.body;
-    if (!email) return res.status(400).send({ message: "Email is required" });
-
-    const users = await col("users");
-    const now = new Date().toISOString();
-    const set = { image: image || "", lastLoginAt: now };
-    if (name) set.name = name;
-
-    await users.updateOne(
-      { email },
-      { $set: set, $setOnInsert: { role: "user", createdAt: now } },
-      { upsert: true }
-    );
-    res.send({ ok: true });
-  })
-);
-
-app.get(
-  "/api/users/:email",
-  wrap(async (req, res) => {
-    const users = await col("users");
-    const u = await users.findOne({ email: req.params.email });
-    if (!u) return res.status(404).send({ message: "User not found" });
-    res.send({ ...u, _id: u._id.toString() });
-  })
-);
-
-// ---------- BOOKINGS ----------
-app.get(
-  "/api/bookings",
-  wrap(async (req, res) => {
-    const email = req.query.email;
-    if (!email) return res.status(400).send({ message: "Email is required" });
-
-    const bookings = await col("bookings");
-    const list = await bookings
-      .find({ userEmail: String(email) })
-      .sort({ createdAt: -1 })
-      .toArray();
-    res.send(list.map((b) => ({ ...b, _id: b._id.toString() })));
-  })
-);
-
-app.post(
-  "/api/bookings",
-  wrap(async (req, res) => {
-    const { studioId, userEmail, date } = req.body;
-    const start = Number(req.body.startHour);
-    const end = Number(req.body.endHour);
-
-    if (!ObjectId.isValid(studioId))
-      return res.status(400).send({ message: "Invalid studio" });
-    if (!userEmail || !date)
-      return res.status(400).send({ message: "userEmail and date are required" });
-    if (!validHour(start) || !validHour(end))
-      return res.status(400).send({ message: "Hours must be between 0 and 24." });
-    if (end <= start)
-      return res.status(400).send({ message: "End time must be after start time." });
-
-    const studios = await col("studios");
-    const bookings = await col("bookings");
-
-    const studio = await studios.findOne({ _id: new ObjectId(studioId) });
-    if (!studio) return res.status(404).send({ message: "Studio not found" });
-
-    // Confirmed booking-এর সঙ্গে overlap check
-    const clash = await bookings.findOne({
-      studioId,
-      date,
-      status: "Confirmed",
-      startHour: { $lt: end },
-      endHour: { $gt: start },
+    const apiToken = jwt.sign({ email: p.email, name: p.name }, process.env.JWT_SECRET, {
+      expiresIn: "7d",
+      audience: "studiospace-api",
     });
-    if (clash)
-      return res.status(409).send({
-        message: `Already booked from ${clash.startHour}:00 to ${clash.endHour}:00 on this date. Pick another slot.`,
-      });
-
-    const doc = {
-      studioId,
-      studioTitle: studio.title,
-      userEmail,
-      date,
-      startHour: start,
-      endHour: end,
-      total: (end - start) * studio.hourlyRate,
-      status: "Pending",
-      createdAt: new Date().toISOString(),
-    };
-    const r = await bookings.insertOne(doc);
-    res.status(201).send({ ...doc, _id: r.insertedId.toString() });
-  })
+    res.cookie("token", apiToken, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 }).send({ ok: true });
+  }, false)
 );
 
-app.patch(
-  "/api/bookings/:id/cancel",
-  wrap(async (req, res) => {
-    if (!ObjectId.isValid(req.params.id))
-      return res.status(400).send({ message: "Invalid id" });
-    const bookings = await col("bookings");
-    const r = await bookings.updateOne(
-      { _id: new ObjectId(req.params.id), status: "Pending" },
-      { $set: { status: "Cancelled" } }
-    );
-    if (!r.matchedCount)
-      return res.status(404).send({ message: "Pending booking not found" });
-    res.send({ ok: true });
-  })
-);
+app.post("/api/logout", handle(async (req, res) => {
+  res.clearCookie("token", cookieOpts).send({ ok: true });
+}, false));
 
+/* ---------------- STUDIOS ---------------- */
+app.get("/api/studios", handle(async (req, res) => {
+  const { search, category, owner, sort, limit } = req.query;
+  const query = {};
+  if (category) query.category = String(category);
+  if (owner) query.ownerEmail = String(owner);
+  if (search) {
+    const rx = new RegExp(escapeRegex(String(search)), "i");
+    query.$or = [{ title: rx }, { location: rx }];
+  }
+  const sorts = {
+    rating: { rating: -1 },
+    newest: { createdAt: -1 },
+    "price-asc": { hourlyRate: 1 },
+    "price-desc": { hourlyRate: -1 },
+  };
+  let cursor = (await col("studios")).find(query).sort(sorts[sort] || sorts.newest);
+  if (limit) cursor = cursor.limit(Math.min(Number(limit) || 20, 100));
+  res.send((await cursor.toArray()).map(ser));
+}, false));
 
-app.patch(
-  "/api/bookings/:id/confirm",
-  wrap(async (req, res) => {
-    if (!ObjectId.isValid(req.params.id))
-      return res.status(400).send({ message: "Invalid id" });
-    const bookings = await col("bookings");
-    const _id = new ObjectId(req.params.id);
+app.get("/api/studios/:id", handle(async (req, res) => {
+  const s = await (await col("studios")).findOne({ _id: oid(req.params.id) });
+  s ? res.send(ser(s)) : fail(res, 404, "Studio not found");
+}, false));
 
-    const b = await bookings.findOne({ _id, status: "Pending" });
-    if (!b) return res.status(404).send({ message: "Pending booking not found" });
+app.post("/api/studios", handle(async (req, res) => {
+  const { _id, rating, createdAt, ownerEmail, ownerName, ...d } = req.body;
+  if (!d.title) return fail(res, 400, "Title is required");
 
-    const clash = await bookings.findOne({
-      _id: { $ne: _id },
-      studioId: b.studioId,
-      date: b.date,
-      status: "Confirmed",
-      startHour: { $lt: b.endHour },
-      endHour: { $gt: b.startHour },
-    });
-    if (clash)
-      return res.status(409).send({
-        message: `Slot already confirmed from ${clash.startHour}:00 to ${clash.endHour}:00.`,
-      });
+  const doc = {
+    ...d,
+    ownerEmail: req.user.email, // body নয়, token থেকে
+    ownerName: req.user.name || ownerName || "",
+    reviews: Array.isArray(d.reviews) ? d.reviews : [],
+    rating: 0,
+    createdAt: new Date().toISOString(),
+  };
+  NUMS.forEach((k) => (doc[k] = Number(d[k])));
+  if (NUMS.some((k) => Number.isNaN(doc[k]))) return fail(res, 400, "hourlyRate, deposit and capacity must be numbers");
 
-    await bookings.updateOne({ _id, status: "Pending" }, { $set: { status: "Confirmed" } });
-    res.send({ ok: true });
-  })
-);
+  const r = await (await col("studios")).insertOne(doc);
+  res.status(201).send({ ...doc, _id: r.insertedId.toString() });
+}));
 
+app.put("/api/studios/:id", handle(async (req, res) => {
+  if (!(await ownStudio(req, res))) return;
+  const { _id, rating, reviews, createdAt, ownerEmail, ownerName, ...patch } = req.body;
+  if (!Object.keys(patch).length) return fail(res, 400, "Nothing to update");
+
+  const bad = NUMS.find((k) => patch[k] !== undefined && Number.isNaN((patch[k] = Number(patch[k]))));
+  if (bad) return fail(res, 400, `${bad} must be a number`);
+
+  await (await col("studios")).updateOne({ _id: oid(req.params.id) }, { $set: patch });
+  res.send({ ok: true });
+}));
+
+app.delete("/api/studios/:id", handle(async (req, res) => {
+  if (!(await ownStudio(req, res))) return;
+  await (await col("studios")).deleteOne({ _id: oid(req.params.id) });
+  res.send({ ok: true });
+}));
+
+app.post("/api/studios/:id/reviews", handle(async (req, res) => {
+  const rating = Number(req.body.rating);
+  const { comment } = req.body;
+  if (!comment || !rating || rating < 1 || rating > 5) return fail(res, 400, "Rating (1-5) and comment are required");
+
+  const studios = await col("studios");
+  const _id = oid(req.params.id);
+  const review = {
+    userName: req.user.name || "Guest",
+    userEmail: req.user.email,
+    rating,
+    comment,
+    createdAt: new Date().toISOString(),
+  };
+  const pushed = await studios.updateOne({ _id }, { $push: { reviews: review } });
+  if (!pushed.matchedCount) return fail(res, 404, "Studio not found");
+
+  const list = (await studios.findOne({ _id }))?.reviews || [];
+  if (list.length) {
+    const avg = list.reduce((sum, x) => sum + x.rating, 0) / list.length;
+    await studios.updateOne({ _id }, { $set: { rating: Math.round(avg * 10) / 10 } });
+  }
+  res.status(201).send(review);
+}));
+
+/* ---------------- USERS ---------------- */
+app.post("/api/users", handle(async (req, res) => {
+  const { name, image } = req.body;
+  const now = new Date().toISOString();
+  await (await col("users")).updateOne(
+    { email: req.user.email },
+    {
+      $set: { image: image || "", lastLoginAt: now, ...(name && { name }) },
+      $setOnInsert: { role: "user", createdAt: now },
+    },
+    { upsert: true }
+  );
+  res.send({ ok: true });
+}));
+
+app.get("/api/users/:email", handle(async (req, res) => {
+  if (req.params.email !== req.user.email) return fail(res, 403, "Forbidden");
+  const u = await (await col("users")).findOne({ email: req.params.email });
+  u ? res.send(ser(u)) : fail(res, 404, "User not found");
+}));
+
+/* ---------------- BOOKINGS ---------------- */
+app.get("/api/bookings", handle(async (req, res) => {
+  const list = await (await col("bookings"))
+    .find({ userEmail: req.user.email }) // শুধু নিজের
+    .sort({ createdAt: -1 })
+    .toArray();
+  res.send(list.map(ser));
+}));
+
+app.post("/api/bookings", handle(async (req, res) => {
+  const { studioId, date } = req.body;
+  const start = Number(req.body.startHour);
+  const end = Number(req.body.endHour);
+
+  if (!ObjectId.isValid(studioId)) return fail(res, 400, "Invalid studio");
+  if (!date) return fail(res, 400, "date is required");
+  if (!validHour(start) || !validHour(end)) return fail(res, 400, "Hours must be between 0 and 24.");
+  if (end <= start) return fail(res, 400, "End time must be after start time.");
+
+  const studio = await (await col("studios")).findOne({ _id: oid(studioId) });
+  if (!studio) return fail(res, 404, "Studio not found");
+
+  const bookings = await col("bookings");
+  const clash = await bookings.findOne({
+    studioId,
+    date,
+    status: "Confirmed",
+    startHour: { $lt: end },
+    endHour: { $gt: start },
+  });
+  if (clash) return fail(res, 409, `Already booked from ${clash.startHour}:00 to ${clash.endHour}:00 on this date. Pick another slot.`);
+
+  const doc = {
+    studioId,
+    studioTitle: studio.title,
+    userEmail: req.user.email, // body নয়, token থেকে
+    date,
+    startHour: start,
+    endHour: end,
+    total: (end - start) * studio.hourlyRate,
+    status: "Pending",
+    createdAt: new Date().toISOString(),
+  };
+  const r = await bookings.insertOne(doc);
+  res.status(201).send({ ...doc, _id: r.insertedId.toString() });
+}));
+
+app.patch("/api/bookings/:id/cancel", handle(async (req, res) => {
+  const r = await (await col("bookings")).updateOne(
+    { _id: oid(req.params.id), status: "Pending", userEmail: req.user.email },
+    { $set: { status: "Cancelled" } }
+  );
+  r.matchedCount ? res.send({ ok: true }) : fail(res, 404, "Pending booking not found");
+}));
+
+// শুধু studio-র host confirm করতে পারবে
+app.patch("/api/bookings/:id/confirm", handle(async (req, res) => {
+  const bookings = await col("bookings");
+  const _id = oid(req.params.id);
+
+  const b = await bookings.findOne({ _id, status: "Pending" });
+  if (!b) return fail(res, 404, "Pending booking not found");
+
+  const studio = ObjectId.isValid(b.studioId) ? await (await col("studios")).findOne({ _id: oid(b.studioId) }) : null;
+  if (!studio || studio.ownerEmail !== req.user.email) return fail(res, 403, "Only the studio host can confirm");
+
+  const clash = await bookings.findOne({
+    _id: { $ne: _id },
+    studioId: b.studioId,
+    date: b.date,
+    status: "Confirmed",
+    startHour: { $lt: b.endHour },
+    endHour: { $gt: b.startHour },
+  });
+  if (clash) return fail(res, 409, `Slot already confirmed from ${clash.startHour}:00 to ${clash.endHour}:00.`);
+
+  await bookings.updateOne({ _id, status: "Pending" }, { $set: { status: "Confirmed" } });
+  res.send({ ok: true });
+}));
 
 app.get("/", (req, res) => res.send({ status: "StudioSpace server running" }));
-
-app.use((req, res) => res.status(404).send({ message: `Route not found: ${req.method} ${req.originalUrl}` }));
+app.use((req, res) => fail(res, 404, `Route not found: ${req.method} ${req.originalUrl}`));
 
 if (require.main === module) {
   app.listen(port, () => console.log(`Server on port ${port}`));
 }
 module.exports = app;
-
-// if (process.env.VERCEL) {
-//   module.exports = app;
-// } else {
-//   app.listen(port, () => console.log(`Server on port ${port}`));
-// }
