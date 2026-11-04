@@ -107,15 +107,21 @@ const col = async (name) => (await getDb()).collection(name);
 /* ---------------- auth ---------------- */
 const AUTH_URL = (process.env.BETTER_AUTH_URL ).replace(/\/$/, "");
 
-// BetterAuth-এর JWT, তার public key (JWKS) দিয়ে যাচাই
-let joseLib, jwks;
+// BetterAuth-এর JWT, তার public key (JWKS) দিয়ে যাচাই।
+// BETTER_AUTH_JWKS env সেট থাকলে সেটা থেকেই local JWK set (Vercel function থেকে
+// *.vercel.app ফেচ block হতে পারে বলে prod-এ নিরাপদ fallback); নাহলে remote JWKS।
+let joseLib, jwks, localJwks;
 async function verifyAuthToken(token) {
   joseLib ||= await import("jose");
-  jwks ||= joseLib.createRemoteJWKSet(new URL(`${ BETTER_AUTH_URL}/api/auth/jwks`));
-  const { payload } = await joseLib.jwtVerify(token, jwks, {
-    issuer: AUTH_URL,
-    audience: AUTH_URL,
-  });
+  const opts = { issuer: AUTH_URL, audience: AUTH_URL };
+  const jwksJSON = process.env.BETTER_AUTH_JWKS;
+  if (jwksJSON) {
+    localJwks ||= joseLib.createLocalJWKSet(JSON.parse(jwksJSON));
+    const { payload } = await joseLib.jwtVerify(token, localJwks, opts);
+    return payload;
+  }
+  jwks ||= joseLib.createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
+  const { payload } = await joseLib.jwtVerify(token, jwks, opts);
   return payload;
 }
 
@@ -128,7 +134,7 @@ const verifyToken = async (req, res, next) => {
     next();
   } catch (e) {
     console.error("Token verify failed:", e.message);
-    fail(res, 401, `verify_token: ${e?.name}: ${e?.message}`);
+    fail(res, 401, "Unauthorized");
   }
 };
 
@@ -156,7 +162,8 @@ app.post("/api/jwt", handle(async (req, res) => {
     });
     res.status(201).send({ ok: true, user: { email: user.email, name: user.name } });
   } catch (e) {
-    fail(res, 401, `verify failed: ${e?.name}: ${e?.message}`);
+    console.error("JWT exchange failed:", e?.message);
+    fail(res, 401, "Unauthorized");
   }
 }));
 
@@ -429,19 +436,6 @@ app.delete("/api/wishlist/:id", handle(async (req, res) => {
 }));
 
 app.get("/", (req, res) => res.send({ status: "StudioSpace server running" }));
-app.post("/api/_debug-env", (req, res) => res.send({
-  gotAuth: req.headers.authorization || null,
-  gotCookie: !!req.headers.cookie,
-  contentType: req.headers["content-type"] || null,
-  bodyLen: JSON.stringify(req.body || {}).length,
-}));
-app.get("/api/_debug-env", (req, res) => res.send({
-  AUTH_URL: process.env.BETTER_AUTH_URL || null,
-  MONGO: !!process.env.MONGODB_URI,
-  FRONTEND: process.env.FRONTEND_URL || null,
-  gotAuth: req.headers.authorization || null,
-  gotCookie: !!req.headers.cookie,
-}));
 app.use((req, res) => fail(res, 404, `Route not found: ${req.method} ${req.originalUrl}`));
 
 if (require.main === module) {
