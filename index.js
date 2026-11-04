@@ -7,15 +7,21 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const app = express();
 const port = process.env.PORT || 5000;
 
-const allowed = [
+/* ---------------- config ---------------- */
+const stripSlash = (u) => String(u || "").replace(/\/$/, "");
 
-  
-  process.env.FRONTEND_URL,
+// BetterAuth (frontend) URL: JWT issuer/audience, JWKS source
+const AUTH_URL = stripSlash(process.env.BETTER_AUTH_URL || "http://localhost:3000");
+
+const allowed = [
+  "http://localhost:3000",
+  AUTH_URL,
+  stripSlash(process.env.FRONTEND_URL),
 ].filter(Boolean);
 
 app.use(
   cors({
-    origin: allowed,
+    origin: [...new Set(allowed)],
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -28,7 +34,7 @@ const client = new MongoClient(process.env.MONGODB_URI, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
 });
 
-/* ---------------- ছোট helper ---------------- */
+/* ---------------- helper ---------------- */
 const fail = (res, code, message) => res.status(code).send({ message });
 const ser = (d) => ({ ...d, _id: d._id.toString() });
 const oid = (id) => new ObjectId(id);
@@ -41,49 +47,6 @@ app.param("id", (req, res, next, id) =>
   ObjectId.isValid(id) ? next() : fail(res, 400, "Invalid id")
 );
 
-/* ---------------- demo data ---------------- */
-const mk = (n, images, title, category, hourlyRate, deposit, capacity, location, rating, amenities, ownerName, ownerEmail, overview) => ({
-  title, category, hourlyRate, deposit, capacity, location,
-  images: images.map((x) => `/studios/${x}.jpg`),
-  amenities, overview, rating, ownerName, ownerEmail,
-  reviews: [
-    { userName: "Ayesha Khan", rating: 5, comment: "Perfect space, the host was very helpful.", createdAt: new Date(2026, 9, 20).toISOString() },
-    { userName: "Sabbir Hasan", rating: 4, comment: "Great equipment and easy booking.", createdAt: new Date(2026, 9, 12).toISOString() },
-  ],
-  createdAt: new Date(2026, 9, 30 - n).toISOString(),
-});
-
-const demoStudios = () => [
-  mk(1, [4, 2, 1], "North Light Cyc Wall", "Photo Studio", 55, 100, 12, "Gulshan, Dhaka", 4.9, ["Wi-Fi", "Lighting kit", "Parking", "Changing room"], "Tanvir Rahman", "tanvir@host.com", "A 20 ft white cyc wall with daylight windows and two strobe heads. Ideal for product, fashion and portrait shoots."),
-  mk(2, [5, 3, 1], "Monsoon Podcast Lounge", "Podcast Lounge", 30, 50, 5, "Dhanmondi, Dhaka", 4.8, ["Wi-Fi", "Acoustic panels", "Kitchenette"], "Nusrat Jahan", "nusrat@host.com", "Four-mic setup with treated walls and a sofa corner, ready for interviews and video podcasts."),
-  mk(3, [2, 4, 3], "Stage 9 Cinema Floor", "Film Stage", 120, 300, 40, "Uttara, Dhaka", 4.7, ["Green screen", "Lighting kit", "Parking", "Blackout curtains"], "Imran Hossain", "imran@host.com", "1,800 sq ft soundproofed stage with a drive-in door and a built-in grid for rigging lights."),
-  mk(4, [1, 3, 5], "Padma Recording Suite", "Music Suite", 45, 120, 8, "Banani, Dhaka", 4.9, ["Acoustic panels", "Wi-Fi", "Kitchenette"], "Rafi Ahmed", "rafi@host.com", "Control room and live room with a vocal booth, 16-channel console and a grand piano."),
-  mk(5, [4, 1, 2], "Clay and Canvas Workshop", "Workshop", 25, 40, 15, "Agrabad, Chattogram", 4.6, ["Wi-Fi", "Kitchenette", "Parking"], "Sadia Islam", "sadia@host.com", "Bright workshop with long tables, a kiln and wall space for painting and ceramics classes."),
-  mk(6, [2, 5, 4], "Blue Hour Loft", "Photo Studio", 40, 80, 10, "Sylhet Sadar", 4.5, ["Wi-Fi", "Lighting kit", "Changing room"], "Mahin Chowdhury", "mahin@host.com", "Brick-wall loft with big windows, props and a small set kitchen for lifestyle shoots."),
-  mk(7, [5, 2, 3], "Echo Room Voiceover Booth", "Podcast Lounge", 20, 30, 3, "Khulna Sadar", 4.4, ["Acoustic panels", "Wi-Fi"], "Farhan Kabir", "farhan@host.com", "Compact isolation booth for voiceover, dubbing and narration, with a large-diaphragm mic on hand."),
-  mk(8, [3, 1, 5], "Riverside Band Room", "Music Suite", 35, 60, 7, "Barishal Sadar", 4.6, ["Parking", "Acoustic panels", "Wi-Fi"], "Demo Examiner", "examiner@studiospace.com", "Rehearsal room with a full backline, drum kit and PA, plus a river view lounge."),
-];
-
-async function seedStudios(db) {
-  const meta = db.collection("meta");
-  try {
-    await meta.insertOne({ _id: "studios-seeded", at: new Date().toISOString() });
-  } catch (e) {
-    if (e.code === 11000) return;
-    throw e;
-  }
-  try {
-    const studios = db.collection("studios");
-    if ((await studios.countDocuments()) === 0) {
-      await studios.insertMany(demoStudios());
-      console.log("Demo studios seeded");
-    }
-  } catch (e) {
-    await meta.deleteOne({ _id: "studios-seeded" });
-    throw e;
-  }
-}
-
 /* ---------------- db ---------------- */
 let dbPromise;
 function getDb() {
@@ -92,7 +55,6 @@ function getDb() {
       await client.connect();
       const db = client.db("studiospace");
       await db.collection("users").createIndex({ email: 1 }, { unique: true });
-      await seedStudios(db);
       console.log("MongoDB connected");
       return db;
     })().catch((e) => {
@@ -105,11 +67,9 @@ function getDb() {
 const col = async (name) => (await getDb()).collection(name);
 
 /* ---------------- auth ---------------- */
-const AUTH_URL = (process.env.BETTER_AUTH_URL ).replace(/\/$/, "");
-
 // BetterAuth-এর JWT, তার public key (JWKS) দিয়ে যাচাই।
-// BETTER_AUTH_JWKS env সেট থাকলে সেটা থেকেই local JWK set (Vercel function থেকে
-// *.vercel.app ফেচ block হতে পারে বলে prod-এ নিরাপদ fallback); নাহলে remote JWKS।
+// BETTER_AUTH_JWKS env সেট থাকলে সেটা থেকেই local JWK set (prod fallback);
+// নাহলে remote JWKS।
 let joseLib, jwks, localJwks;
 async function verifyAuthToken(token) {
   joseLib ||= await import("jose");
@@ -125,12 +85,14 @@ async function verifyAuthToken(token) {
   return payload;
 }
 
+const bearer = (req) => req.headers.authorization?.replace(/^Bearer\s+/i, "");
 
+// Authorization header আগে, না থাকলে HTTPOnly cookie
 const verifyToken = async (req, res, next) => {
-  const token = req.cookies?.token || req.headers.authorization?.replace(/^Bearer\s+/i, "");
+  const token = bearer(req) || req.cookies?.token;
   if (!token) return fail(res, 401, "Unauthorized");
   try {
-    req.user = await verifyAuthToken(token); // email, name এখান থেকে
+    req.user = await verifyAuthToken(token);
     next();
   } catch (e) {
     console.error("Token verify failed:", e.message);
@@ -138,7 +100,8 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
-
+//   handle(fn)        → login লাগবে + error হলে 500
+//   handle(fn, false) → খোলা route + error হলে 500
 const handle = (fn, auth = true) => [
   ...(auth ? [verifyToken] : []),
   (req, res) =>
@@ -148,12 +111,12 @@ const handle = (fn, auth = true) => [
     }),
 ];
 
-
+// token যাচাই করে HTTPOnly cookie-তে রাখে (নিজেই verify করে, তাই খোলা route)
 app.post("/api/jwt", handle(async (req, res) => {
-  const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+  const token = bearer(req);
   if (!token) return fail(res, 401, "Unauthorized");
   try {
-    const user = await verifyAuthToken(token); // শুধু বৈধ token cookie-তে যাবে
+    const user = await verifyAuthToken(token);
     res.cookie("token", token, {
       httpOnly: true,
       sameSite: "none",
@@ -165,14 +128,14 @@ app.post("/api/jwt", handle(async (req, res) => {
     console.error("JWT exchange failed:", e?.message);
     fail(res, 401, "Unauthorized");
   }
-}));
+}, false));
 
 app.delete("/api/jwt", (req, res) => {
-  res.clearCookie("token");
+  res.clearCookie("token", { httpOnly: true, sameSite: "none", secure: true });
   res.send({ ok: true });
 });
 
-
+// studio-র মালিক না হলে error পাঠিয়ে null ফেরত দেয়
 const ownStudio = async (req, res) => {
   const s = await (await col("studios")).findOne({ _id: oid(req.params.id) });
   if (!s) fail(res, 404, "Studio not found");
@@ -292,9 +255,10 @@ app.get("/api/users/:email", handle(async (req, res) => {
 
 /* ---------------- BOOKINGS ---------------- */
 app.get("/api/bookings", handle(async (req, res) => {
-  // ?asHost=1 → এই host-এর সব studio-র booking feed (dashboard-এর Confirm/Complete এর জন্য)
+  // ?asHost=1 → এই host-এর সব studio-র booking feed
   if (req.query.asHost) {
-    const studioIds = await (await col("studios")).find({ ownerEmail: req.user.email }).map((s) => s._id.toString()).toArray();
+    const mine = await (await col("studios")).find({ ownerEmail: req.user.email }).toArray();
+    const studioIds = mine.map((s) => s._id.toString());
     const list = await (await col("bookings"))
       .find({ studioId: { $in: studioIds } })
       .sort({ createdAt: -1 })
@@ -323,7 +287,7 @@ app.post("/api/bookings", handle(async (req, res) => {
 
   const bookings = await col("bookings");
 
-
+  // Challenge 2: Confirmed booking-এর সঙ্গে overlap check
   const clash = await bookings.findOne({
     studioId,
     date,
@@ -336,7 +300,7 @@ app.post("/api/bookings", handle(async (req, res) => {
   const doc = {
     studioId,
     studioTitle: studio.title,
-    userEmail: req.user.email, 
+    userEmail: req.user.email, // body নয়, token থেকে
     date,
     startHour: start,
     endHour: end,
@@ -356,6 +320,7 @@ app.patch("/api/bookings/:id/cancel", handle(async (req, res) => {
   r.matchedCount ? res.send({ ok: true }) : fail(res, 404, "Pending booking not found");
 }));
 
+// শুধু studio-র host confirm করতে পারবে
 app.patch("/api/bookings/:id/confirm", handle(async (req, res) => {
   const bookings = await col("bookings");
   const _id = oid(req.params.id);
@@ -382,7 +347,6 @@ app.patch("/api/bookings/:id/confirm", handle(async (req, res) => {
   res.send({ ok: true });
 }));
 
-
 app.patch("/api/bookings/:id/complete", handle(async (req, res) => {
   const bookings = await col("bookings");
   const b = await bookings.findOne({ _id: oid(req.params.id), status: "Confirmed" });
@@ -397,9 +361,12 @@ app.patch("/api/bookings/:id/complete", handle(async (req, res) => {
   res.send({ ok: true });
 }));
 
-
+/* ---------------- WISHLIST ---------------- */
 app.get("/api/wishlist", handle(async (req, res) => {
-  const u = await (await col("users")).findOne({ email: req.user.email }, { wishlist: 1 });
+  const u = await (await col("users")).findOne(
+    { email: req.user.email },
+    { projection: { wishlist: 1 } }
+  );
   const ids = (u?.wishlist || []).filter((x) => ObjectId.isValid(x));
   if (!ids.length) return res.send([]);
   const docs = await (await col("studios")).find({ _id: { $in: ids.map(oid) } }).toArray();
@@ -409,10 +376,8 @@ app.get("/api/wishlist", handle(async (req, res) => {
 
 app.post("/api/wishlist/:id", handle(async (req, res) => {
   const sid = String(req.params.id);
-  if (!ObjectId.isValid(sid)) return fail(res, 400, "Invalid studio id");
   const studio = await (await col("studios")).findOne({ _id: oid(sid) });
   if (!studio) return fail(res, 404, "Studio not found");
-
 
   await (await col("users")).updateOne(
     { email: req.user.email },
@@ -435,6 +400,7 @@ app.delete("/api/wishlist/:id", handle(async (req, res) => {
   res.send({ ok: true, saved: false });
 }));
 
+/* ---------------- misc ---------------- */
 app.get("/", (req, res) => res.send({ status: "StudioSpace server running" }));
 app.use((req, res) => fail(res, 404, `Route not found: ${req.method} ${req.originalUrl}`));
 
