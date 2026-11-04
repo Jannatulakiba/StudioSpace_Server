@@ -1,19 +1,15 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const jwt = require("jsonwebtoken");
 const cookieParser = require("cookie-parser");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 
 const app = express();
 const port = process.env.PORT || 5000;
-const isProd = process.env.NODE_ENV === "production";
-if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is not set");
 
 const allowed = [
-  "http://localhost:3000",
-  "https://a8-studio-space.vercel.app",
-  "https://studiospace-mu.vercel.app",
+
+  
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
@@ -45,7 +41,7 @@ app.param("id", (req, res, next, id) =>
   ObjectId.isValid(id) ? next() : fail(res, 400, "Invalid id")
 );
 
-/* ---------------- db ---------------- */
+/* ---------------- demo data ---------------- */
 const mk = (n, images, title, category, hourlyRate, deposit, capacity, location, rating, amenities, ownerName, ownerEmail, overview) => ({
   title, category, hourlyRate, deposit, capacity, location,
   images: images.map((x) => `/studios/${x}.jpg`),
@@ -88,6 +84,7 @@ async function seedStudios(db) {
   }
 }
 
+/* ---------------- db ---------------- */
 let dbPromise;
 function getDb() {
   if (!dbPromise) {
@@ -108,35 +105,34 @@ function getDb() {
 const col = async (name) => (await getDb()).collection(name);
 
 /* ---------------- auth ---------------- */
-const AUTH_URL = (process.env.BETTER_AUTH_URL || "http://localhost:3000").replace(/\/$/, "");
-const cookieOpts = {
-  httpOnly: true,
-  secure: isProd,
-  sameSite: isProd ? "none" : "lax",
-  path: "/",
-};
+const AUTH_URL = (process.env.BETTER_AUTH_URL ).replace(/\/$/, "");
 
 // BetterAuth-এর JWT, তার public key (JWKS) দিয়ে যাচাই
 let joseLib, jwks;
 async function verifyAuthToken(token) {
   joseLib ||= await import("jose");
-  jwks ||= joseLib.createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
-  const { payload } = await joseLib.jwtVerify(token, jwks, { issuer: AUTH_URL, audience: AUTH_URL });
+  jwks ||= joseLib.createRemoteJWKSet(new URL(`${ BETTER_AUTH_URL}/api/auth/jwks`));
+  const { payload } = await joseLib.jwtVerify(token, jwks, {
+    issuer: AUTH_URL,
+    audience: AUTH_URL,
+  });
   return payload;
 }
 
-const verifyToken = (req, res, next) => {
+
+const verifyToken = async (req, res, next) => {
+  const token = req.cookies?.token || req.headers.authorization?.replace(/^Bearer\s+/i, "");
+  if (!token) return fail(res, 401, "Unauthorized");
   try {
-    req.user = jwt.verify(req.cookies?.token, process.env.JWT_SECRET, { audience: "studiospace-api" });
+    req.user = await verifyAuthToken(token); // email, name এখান থেকে
     next();
-  } catch {
+  } catch (e) {
+    console.error("Token verify failed:", e.message);
     fail(res, 401, "Unauthorized");
   }
 };
 
-// সব route-এর জন্য একটাই function:
-//   handle(fn)        → login লাগবে (verifyToken) + error হলে 500
-//   handle(fn, false) → খোলা route + error হলে 500
+
 const handle = (fn, auth = true) => [
   ...(auth ? [verifyToken] : []),
   (req, res) =>
@@ -146,7 +142,26 @@ const handle = (fn, auth = true) => [
     }),
 ];
 
-// studio-র মালিক না হলে error পাঠিয়ে null ফেরত দেয়
+
+app.post("/api/jwt", handle(async (req, res) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+  if (!token) return fail(res, 401, "Unauthorized");
+  const user = await verifyAuthToken(token); // শুধু বৈধ token cookie-তে যাবে
+  res.cookie("token", token, {
+    httpOnly: true,
+    sameSite: "none",
+    secure: true, 
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+  });
+  res.status(201).send({ ok: true, user: { email: user.email, name: user.name } });
+}));
+
+app.delete("/api/jwt", (req, res) => {
+  res.clearCookie("token");
+  res.send({ ok: true });
+});
+
+
 const ownStudio = async (req, res) => {
   const s = await (await col("studios")).findOne({ _id: oid(req.params.id) });
   if (!s) fail(res, 404, "Studio not found");
@@ -154,31 +169,6 @@ const ownStudio = async (req, res) => {
   else return s;
   return null;
 };
-
-app.post(
-  "/api/jwt",
-  handle(async (req, res) => {
-    if (!req.body.token) return fail(res, 400, "token is required");
-    let p;
-    try {
-      p = await verifyAuthToken(req.body.token);
-    } catch (e) {
-      console.error("Auth token verify failed:", e.message);
-      return fail(res, 401, "Invalid or expired token");
-    }
-    if (!p.email) return fail(res, 401, "Token has no email");
-
-    const apiToken = jwt.sign({ email: p.email, name: p.name }, process.env.JWT_SECRET, {
-      expiresIn: "7d",
-      audience: "studiospace-api",
-    });
-    res.cookie("token", apiToken, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 }).send({ ok: true });
-  }, false)
-);
-
-app.post("/api/logout", handle(async (req, res) => {
-  res.clearCookie("token", cookieOpts).send({ ok: true });
-}, false));
 
 /* ---------------- STUDIOS ---------------- */
 app.get("/api/studios", handle(async (req, res) => {
@@ -275,7 +265,7 @@ app.post("/api/users", handle(async (req, res) => {
   await (await col("users")).updateOne(
     { email: req.user.email },
     {
-      $set: { image: image || "", lastLoginAt: now, ...(name && { name }) },
+      $set: { image: image || "", lastLoginAt: now, ...((name || req.user.name) && { name: name || req.user.name }) },
       $setOnInsert: { role: "user", createdAt: now },
     },
     { upsert: true }
@@ -291,6 +281,15 @@ app.get("/api/users/:email", handle(async (req, res) => {
 
 /* ---------------- BOOKINGS ---------------- */
 app.get("/api/bookings", handle(async (req, res) => {
+  // ?asHost=1 → এই host-এর সব studio-র booking feed (dashboard-এর Confirm/Complete এর জন্য)
+  if (req.query.asHost) {
+    const studioIds = await (await col("studios")).find({ ownerEmail: req.user.email }).map((s) => s._id.toString()).toArray();
+    const list = await (await col("bookings"))
+      .find({ studioId: { $in: studioIds } })
+      .sort({ createdAt: -1 })
+      .toArray();
+    return res.send(list.map(ser));
+  }
   const list = await (await col("bookings"))
     .find({ userEmail: req.user.email }) // শুধু নিজের
     .sort({ createdAt: -1 })
@@ -312,6 +311,8 @@ app.post("/api/bookings", handle(async (req, res) => {
   if (!studio) return fail(res, 404, "Studio not found");
 
   const bookings = await col("bookings");
+
+
   const clash = await bookings.findOne({
     studioId,
     date,
@@ -324,7 +325,7 @@ app.post("/api/bookings", handle(async (req, res) => {
   const doc = {
     studioId,
     studioTitle: studio.title,
-    userEmail: req.user.email, // body নয়, token থেকে
+    userEmail: req.user.email, 
     date,
     startHour: start,
     endHour: end,
@@ -344,7 +345,6 @@ app.patch("/api/bookings/:id/cancel", handle(async (req, res) => {
   r.matchedCount ? res.send({ ok: true }) : fail(res, 404, "Pending booking not found");
 }));
 
-// শুধু studio-র host confirm করতে পারবে
 app.patch("/api/bookings/:id/confirm", handle(async (req, res) => {
   const bookings = await col("bookings");
   const _id = oid(req.params.id);
@@ -352,7 +352,9 @@ app.patch("/api/bookings/:id/confirm", handle(async (req, res) => {
   const b = await bookings.findOne({ _id, status: "Pending" });
   if (!b) return fail(res, 404, "Pending booking not found");
 
-  const studio = ObjectId.isValid(b.studioId) ? await (await col("studios")).findOne({ _id: oid(b.studioId) }) : null;
+  const studio = ObjectId.isValid(b.studioId)
+    ? await (await col("studios")).findOne({ _id: oid(b.studioId) })
+    : null;
   if (!studio || studio.ownerEmail !== req.user.email) return fail(res, 403, "Only the studio host can confirm");
 
   const clash = await bookings.findOne({
@@ -367,6 +369,59 @@ app.patch("/api/bookings/:id/confirm", handle(async (req, res) => {
 
   await bookings.updateOne({ _id, status: "Pending" }, { $set: { status: "Confirmed" } });
   res.send({ ok: true });
+}));
+
+
+app.patch("/api/bookings/:id/complete", handle(async (req, res) => {
+  const bookings = await col("bookings");
+  const b = await bookings.findOne({ _id: oid(req.params.id), status: "Confirmed" });
+  if (!b) return fail(res, 404, "Confirmed booking not found");
+
+  const studio = ObjectId.isValid(b.studioId)
+    ? await (await col("studios")).findOne({ _id: oid(b.studioId) })
+    : null;
+  if (!studio || studio.ownerEmail !== req.user.email) return fail(res, 403, "Only the studio host can complete");
+
+  await bookings.updateOne({ _id: b._id }, { $set: { status: "Completed" } });
+  res.send({ ok: true });
+}));
+
+
+app.get("/api/wishlist", handle(async (req, res) => {
+  const u = await (await col("users")).findOne({ email: req.user.email }, { wishlist: 1 });
+  const ids = (u?.wishlist || []).filter((x) => ObjectId.isValid(x));
+  if (!ids.length) return res.send([]);
+  const docs = await (await col("studios")).find({ _id: { $in: ids.map(oid) } }).toArray();
+  const map = new Map(docs.map((d) => [d._id.toString(), ser(d)]));
+  res.send(ids.map((x) => map.get(x)).filter(Boolean)); // নিজের সেভ-এর order-এ
+}));
+
+app.post("/api/wishlist/:id", handle(async (req, res) => {
+  const sid = String(req.params.id);
+  if (!ObjectId.isValid(sid)) return fail(res, 400, "Invalid studio id");
+  const studio = await (await col("studios")).findOne({ _id: oid(sid) });
+  if (!studio) return fail(res, 404, "Studio not found");
+
+
+  await (await col("users")).updateOne(
+    { email: req.user.email },
+    {
+      $addToSet: { wishlist: sid },
+      $set: { name: req.user.name || "" },
+      $setOnInsert: { role: "user", createdAt: new Date().toISOString() },
+    },
+    { upsert: true }
+  );
+  res.send({ ok: true, saved: true });
+}));
+
+app.delete("/api/wishlist/:id", handle(async (req, res) => {
+  await (await col("users")).updateOne(
+    { email: req.user.email },
+    { $pull: { wishlist: String(req.params.id) } },
+    { upsert: true }
+  );
+  res.send({ ok: true, saved: false });
 }));
 
 app.get("/", (req, res) => res.send({ status: "StudioSpace server running" }));

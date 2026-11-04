@@ -25,13 +25,21 @@ const studios = [
 
 (async () => {
   const client = new MongoClient(process.env.MONGODB_URI);
-  await client.connect();
-  const col = client.db("studiospace").collection("studios");
-  if ((await col.countDocuments()) > 0) {
-    console.log("Studios already exist, skipping seed.");
-  } else {
-    await col.insertMany(studios);
-    console.log(`Inserted ${studios.length} studios`);
+  try {
+    await client.connect();
+    const col = client.db("studiospace").collection("studios");
+
+    let added = 0;
+    for (const s of studios) {
+      const r = await col.updateOne(
+        { title: s.title, ownerEmail: s.ownerEmail },
+        { $setOnInsert: s },
+        { upsert: true }
+      );
+      if (r.upsertedCount) added++;
+    }
+    console.log(`Added ${added} demo studios (${studios.length - added} already existed)`);
+  } finally {
+    await client.close();
   }
-  await client.close();
 })();
