@@ -128,7 +128,7 @@ const verifyToken = async (req, res, next) => {
     next();
   } catch (e) {
     console.error("Token verify failed:", e.message);
-    fail(res, 401, "Unauthorized");
+    fail(res, 401, `verify_token: ${e?.name}: ${e?.message}`);
   }
 };
 
@@ -146,14 +146,18 @@ const handle = (fn, auth = true) => [
 app.post("/api/jwt", handle(async (req, res) => {
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
   if (!token) return fail(res, 401, "Unauthorized");
-  const user = await verifyAuthToken(token); // শুধু বৈধ token cookie-তে যাবে
-  res.cookie("token", token, {
-    httpOnly: true,
-    sameSite: "none",
-    secure: true, 
-    maxAge: 30 * 24 * 60 * 60 * 1000,
-  });
-  res.status(201).send({ ok: true, user: { email: user.email, name: user.name } });
+  try {
+    const user = await verifyAuthToken(token); // শুধু বৈধ token cookie-তে যাবে
+    res.cookie("token", token, {
+      httpOnly: true,
+      sameSite: "none",
+      secure: true,
+      maxAge: 30 * 24 * 60 * 60 * 1000,
+    });
+    res.status(201).send({ ok: true, user: { email: user.email, name: user.name } });
+  } catch (e) {
+    fail(res, 401, `verify failed: ${e?.name}: ${e?.message}`);
+  }
 }));
 
 app.delete("/api/jwt", (req, res) => {
@@ -425,6 +429,19 @@ app.delete("/api/wishlist/:id", handle(async (req, res) => {
 }));
 
 app.get("/", (req, res) => res.send({ status: "StudioSpace server running" }));
+app.post("/api/_debug-env", (req, res) => res.send({
+  gotAuth: req.headers.authorization || null,
+  gotCookie: !!req.headers.cookie,
+  contentType: req.headers["content-type"] || null,
+  bodyLen: JSON.stringify(req.body || {}).length,
+}));
+app.get("/api/_debug-env", (req, res) => res.send({
+  AUTH_URL: process.env.BETTER_AUTH_URL || null,
+  MONGO: !!process.env.MONGODB_URI,
+  FRONTEND: process.env.FRONTEND_URL || null,
+  gotAuth: req.headers.authorization || null,
+  gotCookie: !!req.headers.cookie,
+}));
 app.use((req, res) => fail(res, 404, `Route not found: ${req.method} ${req.originalUrl}`));
 
 if (require.main === module) {
